@@ -1,0 +1,1083 @@
+Ypologistiki
+----------------------------------------------
+
+initial code
+----------------------------------------------
+DATA_PROCESSING.PY
+
+import numpy as np
+import rasterio
+import os
+from tqdm import tqdm
+import yaml
+
+def load_and_preprocess_data():
+    """Load raw soil data and normalize it according to params.yaml"""
+    with open("configs/params.yaml") as f:
+        config = yaml.safe_load(f)
+    
+    os.makedirs("data/processed/normalized", exist_ok=True)
+    
+    for layer in tqdm(config['environment']['soil_layers'], desc="Processing soil layers"):
+        try:
+            # Load raw data (assuming GeoTIFF format)
+            with rasterio.open(f"data/raw/{layer}.tif") as src:
+                data = src.read(1)
+        except FileNotFoundError:
+            print(f"No raw data found for {layer}, creating synthetic data...")
+            data = _create_synthetic_data(layer, config)
+        
+        # Normalize to [0,1] range based on config
+        min_val, max_val = config['environment']['normalization_ranges'][layer]
+        normalized = (data - min_val) / (max_val - min_val)
+        normalized = np.clip(normalized, 0, 1)
+        
+        # Save normalized data
+        np.save(f"data/processed/normalized/{layer}.npy", normalized.astype(np.float32))
+    
+    print("Data preprocessing completed")
+
+def _create_synthetic_data(layer, config):
+    """Create realistic synthetic data for missing layers"""
+    min_val, max_val = config['environment']['normalization_ranges'][layer]
+    
+    # Create base terrain with Perlin noise would be better, but using simple normal dist for demo
+    shape = (100, 100)  # 100x100 grid
+    
+    if layer == 'ph_water':
+        # pH is usually slightly acidic for apple trees
+        data = np.random.normal(6.0, 0.5, shape)
+    elif layer == 'nitrogen':
+        # Nitrogen typically has lower values
+        data = np.random.normal(2.0, 0.5, shape)
+    elif layer in ['clay', 'silt', 'sand']:
+        # Soil texture components (will be normalized to sum to ~100%)
+        if layer == 'clay':
+            data = np.random.normal(25, 5, shape)
+        elif layer == 'silt':
+            data = np.random.normal(40, 5, shape)
+        else:  # sand
+            data = np.random.normal(35, 5, shape)
+    else:
+        data = np.random.uniform(min_val, max_val, shape)
+    
+    return np.clip(data, min_val, max_val)
+
+def validate_soil_texture():
+    """Ensure clay+silt+sand ≈ 100% for all positions"""
+    with open("configs/params.yaml") as f:
+        config = yaml.safe_load(f)
+    
+    texture_layers = ['clay', 'silt', 'sand']
+    if all(layer in config['environment']['soil_layers'] for layer in texture_layers):
+        # Load normalized data
+        soil_data = {}
+        for layer in texture_layers:
+            path = f"data/processed/normalized/{layer}.npy"
+            soil_data[layer] = np.load(path)
+        
+        # Convert to real values
+        real_values = {}
+        for layer in texture_layers:
+            min_val, max_val = config['environment']['normalization_ranges'][layer]
+            real_values[layer] = soil_data[layer] * (max_val - min_val) + min_val
+        
+        # Check sums
+        total = sum(real_values[layer] for layer in texture_layers)
+        print(f"Texture composition stats: Min={total.min():.1f}%, Max={total.max():.1f}%, Mean={total.mean():.1f}%")
+
+
+
+------------------------------------------------
+APPLE_FARMING_ENV.PY
+
+
+import numpy as np
+import yaml
+from gymnasium import Env
+from gymnasium.spaces import Box
+
+class AppleFarmingEnv(Env):
+    def __init__(self, config_path='configs/params.yaml'):
+        with open(config_path) as f:
+            self.config = yaml.safe_load(f)
+        
+        # Load processed soil data
+        self.soil_data = self._load_soil_data()
+        self.current_pos = self._random_position()
+        
+        # Action space: [water_amount, fertilizer_amount, pesticide_amount]
+        self.action_space = Box(low=0, high=1, shape=(3,), dtype=np.float32)
+        
+        # Observation space
+        n_soil_layers = len(self.config['environment']['soil_layers'])
+        self.observation_space = Box(
+            low=0, 
+            high=1, 
+            shape=(n_soil_layers + 3,),  # soil layers + previous actions
+            dtype=np.float32
+        )
+        
+        self.apple_variety = self.config['environment']['apple_variety']
+        self.step_count = 0
+        self.reset()
+    
+    def _load_soil_data(self):
+        """Load normalized soil data"""
+        soil_data = {}
+        for layer in self.config['environment']['soil_layers']:
+            path = f"data/processed/normalized/{layer}.npy"
+            soil_data[layer] = np.load(path)
+        return soil_data
+    
+    def _random_position(self):
+        """Get random position within bounds"""
+        sample_layer = self.config['environment']['soil_layers'][0]
+        h, w = self.soil_data[sample_layer].shape
+        return (np.random.randint(0, h), np.random.randint(0, w))
+    
+    def _get_soil_observation(self):
+        """Get current soil properties"""
+        return np.array([self.soil_data[layer][self.current_pos] 
+                        for layer in self.config['environment']['soil_layers']],
+                      dtype=np.float32)
+    
+    def _get_obs(self):
+        """Combine all observations into single array"""
+        return np.concatenate([
+            self._get_soil_observation(),
+            self.previous_actions
+        ], dtype=np.float32)
+    
+    def _update_soil(self, action):
+        """Update soil properties based on actions"""
+        water_amount, fertilizer_amount, pesticide_amount = action
+        x, y = self.current_pos
+        
+        # Update soil properties (example dynamics)
+        if 'nitrogen' in self.soil_data:
+            self.soil_data['nitrogen'][x, y] -= 0.01 * fertilizer_amount
+        
+        if 'ph_water' in self.soil_data:
+            self.soil_data['ph_water'][x, y] += 0.002 * water_amount
+        
+        if 'organic_matter' in self.soil_data:
+            self.soil_data['organic_matter'][x, y] += 0.001 * fertilizer_amount
+        
+        # Ensure values stay normalized
+        for layer in self.soil_data:
+            self.soil_data[layer][x, y] = np.clip(
+                self.soil_data[layer][x, y], 
+                0, 
+                1
+            )
+    
+    def reset(self, seed=None, options=None):
+        """Reset the environment to initial state"""
+        self.step_count = 0
+        self.current_pos = self._random_position()
+        self.previous_actions = np.zeros(3, dtype=np.float32)
+        return self._get_obs(), {}
+    
+    def step(self, action):
+        """Execute one time step in the environment"""
+        action = np.array(action, dtype=np.float32).clip(0, 1)
+        
+        # Update soil state first
+        self._update_soil(action)
+        
+        # Get updated soil observations
+        soil_obs = self._get_soil_observation()
+        
+        # Calculate reward
+        reward = 10 * self._calculate_reward(soil_obs, action)
+        if reward is None:
+            reward = 0.0
+        
+        # Update episode tracking
+        self.step_count += 1
+        terminated = self.step_count >= 100
+        truncated = False
+        
+        # Update agent state
+        self.previous_actions = action
+        self.current_pos = self._random_position()
+        
+        return self._get_obs(), float(reward), terminated, truncated, {}
+    
+    def _calculate_reward(self, soil_obs, action):
+        """Calculate reward based on soil conditions and actions"""
+        try:
+            real_values = {}
+            for i, layer in enumerate(self.config['environment']['soil_layers']):
+                min_val, max_val = self.config['environment']['normalization_ranges'][layer]
+                real_values[layer] = soil_obs[i] * (max_val - min_val) + min_val
+            
+            scores = []
+            for layer, value in real_values.items():
+                if layer in self.config['environment']['optimal_conditions']:
+                    low, high = self.config['environment']['optimal_conditions'][layer]
+                    if value < low:
+                        scores.append(value / low)
+                    elif value > high:
+                        scores.append(1 - (value - high) / (high * 0.5))
+                    else:
+                        scores.append(1.0)
+            
+            # Texture balance check
+            if all(layer in real_values for layer in ['clay', 'silt', 'sand']):
+                texture_sum = real_values['clay'] + real_values['silt'] + real_values['sand']
+                texture_penalty = min(1.0, abs(texture_sum - 100) / 10)
+                scores.append(1 - texture_penalty)
+            
+            # Resource efficiency penalty
+            resource_penalty = np.sum(action) * 0.2
+            return float(np.mean(scores) - resource_penalty)
+        except Exception as e:
+            print(f"Error calculating reward: {e}")
+            return 0.0
+
+
+-------------------------------------------------------
+MAIN.PY
+
+
+import os
+from stable_baselines3 import PPO
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.callbacks import CheckpointCallback
+from environment.apple_farming_env import AppleFarmingEnv
+from utils.data_processing import load_and_preprocess_data
+import yaml
+
+def train():
+    try:
+        # Load config
+        with open("configs/params.yaml") as f:
+            config = yaml.safe_load(f)
+
+        # Create environment
+        env = AppleFarmingEnv()
+        env = Monitor(env)
+        env = DummyVecEnv([lambda: env])
+    
+        # Create model
+        model = PPO(
+            "MlpPolicy",
+            env,
+            verbose=1,
+            tensorboard_log="./logs/",
+            learning_rate=config['rl']['learning_rate'],
+            n_steps=config['rl']['n_steps'],
+            batch_size=config['rl']['batch_size'],
+            gamma=config['rl']['gamma'],
+            policy_kwargs={
+                "net_arch": dict(pi=[64, 64], vf=[64, 64])
+            }
+        )
+
+        checkpoint_callback = CheckpointCallback(
+            save_freq=10000,
+            save_path='./logs/',
+            name_prefix='rl_model'
+        )
+    
+        # Train the model
+        model.learn(
+            total_timesteps=config['rl']['total_timesteps'],
+            callback=checkpoint_callback,
+            progress_bar=True
+        )
+    except Exception as e:
+        print(f"Training failed: {e}")
+        # Save any partial progress
+        if 'model' in locals():
+            model.save("models/partial_model")
+        raise
+    
+    # Save the model
+    model.save(f"models/ppo_apple_{config['environment']['apple_variety']}")
+    print("Training completed and model saved")
+
+if __name__ == "__main__":
+    # Preprocess data if needed
+    if not os.path.exists("data/processed/normalized"):
+        load_and_preprocess_data()
+    
+    # Train the model
+    train()
+
+
+
+
+
+
+
+FINAL CODE
+---------------------------------
+data_processing.py
+
+import numpy as np
+import rasterio
+import os
+from tqdm import tqdm
+import yaml
+
+def load_and_preprocess_data():
+    """Load raw soil data and normalize it according to params.yaml"""
+    with open("configs/params.yaml") as f:
+        config = yaml.safe_load(f)
+    
+    os.makedirs("data/processed/normalized", exist_ok=True)
+    
+    for layer in tqdm(config['environment']['soil_layers'], desc="Processing soil layers"):
+        try:
+            # Load raw data (assuming GeoTIFF format)
+            with rasterio.open(f"data/raw/{layer}.tif") as src:
+                data = src.read(1)
+        except FileNotFoundError:
+            print(f"No raw data found for {layer}, creating synthetic data...")
+            data = _create_synthetic_data(layer, config)
+        
+        # Normalize to [0,1] range based on config
+        min_val, max_val = config['environment']['normalization_ranges'][layer]
+        normalized = (data - min_val) / (max_val - min_val)
+        normalized = np.clip(normalized, 0, 1)
+        
+        # Save normalized data
+        np.save(f"data/processed/normalized/{layer}.npy", normalized.astype(np.float32))
+    
+    print("Data preprocessing completed")
+
+def _create_synthetic_data(layer, config):
+    """Create realistic synthetic data for missing layers"""
+    min_val, max_val = config['environment']['normalization_ranges'][layer]
+    
+    # Create base terrain with Perlin noise would be better, but using simple normal dist for demo
+    shape = (100, 100)  # 100x100 grid
+    
+    if layer == 'ph_water':
+        # pH is usually slightly acidic for apple trees
+        data = np.random.normal(6.0, 0.5, shape)
+    elif layer == 'nitrogen':
+        # Nitrogen typically has lower values
+        data = np.random.normal(2.0, 0.5, shape)
+    elif layer in ['clay', 'silt', 'sand']:
+        # Soil texture components (will be normalized to sum to ~100%)
+        if layer == 'clay':
+            data = np.random.normal(25, 5, shape)
+        elif layer == 'silt':
+            data = np.random.normal(40, 5, shape)
+        else:  # sand
+            data = np.random.normal(35, 5, shape)
+    else:
+        data = np.random.uniform(min_val, max_val, shape)
+    
+    return np.clip(data, min_val, max_val)
+
+def validate_soil_texture():
+    """Ensure clay+silt+sand ≈ 100% for all positions"""
+    with open("configs/params.yaml") as f:
+        config = yaml.safe_load(f)
+    
+    texture_layers = ['clay', 'silt', 'sand']
+    if all(layer in config['environment']['soil_layers'] for layer in texture_layers):
+        # Load normalized data
+        soil_data = {}
+        for layer in texture_layers:
+            path = f"data/processed/normalized/{layer}.npy"
+            soil_data[layer] = np.load(path)
+        
+        # Convert to real values
+        real_values = {}
+        for layer in texture_layers:
+            min_val, max_val = config['environment']['normalization_ranges'][layer]
+            real_values[layer] = soil_data[layer] * (max_val - min_val) + min_val
+        
+        # Check sums
+        total = sum(real_values[layer] for layer in texture_layers)
+        print(f"Texture composition stats: Min={total.min():.1f}%, Max={total.max():.1f}%, Mean={total.mean():.1f}%")
+
+
+
+-------------------------------------
+#weather_generator.py
+
+import numpy as np
+import os
+
+def generate_weather_data(days=365, seed=42, out_path='data/processed/weather_data.npy'):
+    np.random.seed(seed)
+    weather = []
+
+    for day in range(days):
+        temp = 15 + 10 * np.sin(2 * np.pi * day / 365) + np.random.normal(0, 2)
+        rainfall = max(0, np.random.normal(0.2, 0.1))
+        sunlight = 8 + 4 * np.sin(2 * np.pi * (day + 90) / 365) + np.random.normal(0, 1)
+        weather.append([temp, rainfall, sunlight])
+
+    weather = np.array(weather, dtype=np.float32)
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    np.save(out_path, weather)
+    print(f"Weather data saved to: {out_path}")
+
+if __name__ == "__main__":
+    generate_weather_data()
+
+
+--------------------------------------------------
+#apple_farming_env.py   (Box : for ppo and a2c. also used Discrete for DQN)
+
+import numpy as np
+import yaml
+from gymnasium import Env
+from gymnasium.spaces import Box, Dict
+from enum import Enum
+
+class GrowthStage(Enum):
+    DORMANT = 0
+    BLOOM = 1
+    FRUIT_DEVELOPMENT = 2
+    HARVEST = 3
+
+class AppleFarmingEnv(Env):
+    def __init__(self, config_path='configs/params.yaml'):
+        with open(config_path) as f:
+            self.config = yaml.safe_load(f)
+        
+        # Load processed soil data
+        self.soil_data = self._load_soil_data()
+        self.weather_data = np.load('data/processed/weather_data.npy')
+        self.current_pos = self._random_position()
+        
+        # Action space: [water_amount, fertilizer_amount, pesticide_amount]
+        self.action_space = Box(low=0, high=1, shape=(3,), dtype=np.float32)
+        self.growth_stage = GrowthStage.DORMANT
+        self.growth_days = 0
+        self.max_growth_days = self.config['environment']['growth_stage_days']
+
+        # Observation space
+        n_soil_layers = len(self.config['environment']['soil_layers'])
+        self.observation_space = Dict({
+            'soil': Box(low=0, high=1, shape=(n_soil_layers,), dtype=np.float32),
+            'weather': Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
+            'growth_stage': Box(low=0, high=3, shape=(1,), dtype=np.int32),
+            'previous_actions': Box(low=0, high=1, shape=(3,), dtype=np.float32)
+        })
+        
+        self.apple_variety = self.config['environment']['apple_variety']
+        self.step_count = 0
+        self.reset()
+    
+    def _load_weather(self, day):
+        """Get normalized weather data for current day"""
+        weather = self.weather_data[day % len(self.weather_data)]
+        # Normalize weather data
+        return np.array([
+            (weather[0] - 10) / 20,  # Temp (normalized 0-1 for 10-30°C)
+            min(weather[1] / 0.5, 1), # Rainfall (capped at 0.5)
+            weather[2] / 12           # Sunlight hours
+        ], dtype=np.float32)
+    
+    def _update_growth_stage(self):
+        """Transition between growth stages based on elapsed days"""
+        self.growth_days += 1
+        if self.growth_days > sum(self.max_growth_days[:self.growth_stage.value + 1]):
+            if self.growth_stage != GrowthStage.HARVEST:
+                self.growth_stage = GrowthStage(self.growth_stage.value + 1)
+
+    def _load_soil_data(self):
+        """Load normalized soil data"""
+        soil_data = {}
+        for layer in self.config['environment']['soil_layers']:
+            path = f"data/processed/normalized/{layer}.npy"
+            soil_data[layer] = np.load(path)
+        return soil_data
+    
+    def _random_position(self):
+        """Get random position within bounds"""
+        sample_layer = self.config['environment']['soil_layers'][0]
+        h, w = self.soil_data[sample_layer].shape
+        return (np.random.randint(0, h), np.random.randint(0, w))
+    
+    def _get_soil_observation(self):
+        """Get current soil properties"""
+        return np.array([self.soil_data[layer][self.current_pos] 
+                        for layer in self.config['environment']['soil_layers']],
+                      dtype=np.float32)
+    
+    def _get_obs(self):
+        """Combine all observations into single array"""
+        current_day = self.step_count % 365
+        return {
+            'soil': self._get_soil_observation(),
+            'weather': self._load_weather(current_day),
+            'growth_stage': np.array([self.growth_stage.value], dtype=np.int32),
+            'previous_actions': self.previous_actions
+        }
+    
+    def _update_soil(self, action):
+        """Update soil properties based on actions"""
+        water_amount, fertilizer_amount, pesticide_amount = action
+        x, y = self.current_pos
+        
+        # Update soil properties (example dynamics)
+        if 'nitrogen' in self.soil_data:
+            self.soil_data['nitrogen'][x, y] -= 0.01 * fertilizer_amount
+        
+        if 'ph_water' in self.soil_data:
+            self.soil_data['ph_water'][x, y] += 0.002 * water_amount
+        
+        if 'organic_matter' in self.soil_data:
+            self.soil_data['organic_matter'][x, y] += 0.001 * fertilizer_amount
+        
+        # Ensure values stay normalized
+        for layer in self.soil_data:
+            self.soil_data[layer][x, y] = np.clip(
+                self.soil_data[layer][x, y], 
+                0, 
+                1
+            )
+    
+    def reset(self, seed=None, options=None):
+        """Reset the environment to initial state"""
+        self.step_count = 0
+        self.current_pos = self._random_position()
+        self.previous_actions = np.zeros(3, dtype=np.float32)
+        return self._get_obs(), {}
+    
+    def step(self, action):
+        """Execute one time step in the environment"""
+        action = np.array(action, dtype=np.float32).clip(0, 1)
+        
+        self._update_soil(action)
+        self._update_growth_stage()
+        
+        obs = self._get_obs()
+        reward = self._calculate_reward(obs['soil'], action)
+        
+        # Update episode tracking
+        self.step_count += 1
+        terminated = self.step_count >= 100 
+        truncated = False
+        
+        # Update agent state
+        self.previous_actions = action
+        self.current_pos = self._random_position()
+        
+        return obs, float(reward), terminated, truncated, {}
+    
+    def _calculate_reward(self, soil_obs: np.ndarray, action: np.ndarray) -> float:
+       """Calculate reward strictly in range [0, 1] with proper scaling"""
+       try:
+           # Initialize components
+           soil_score = 0.0
+           optimal_count = 0
+           total_params = len(self.config['environment']['soil_layers'])
+         
+           # 1. Soil quality (0-0.6 range)
+           for i, layer in enumerate(self.config['environment']['soil_layers']):
+               value = soil_obs[i]
+               if layer in self.config['environment']['optimal_conditions']:
+                   low, high = self.config['environment']['optimal_conditions'][layer]
+                   if low <= value <= high:
+                       soil_score += 0.6/total_params  # Balanced bonus
+                       optimal_count += 1
+                   elif value < low:
+                       soil_score += 0.3/total_params * (value/low)  # Partial credit
+                   else:
+                       soil_score += 0.3/total_params * (1 - (value-high)/(1-high))  # Partial credit
+        
+           # 2. Growth stage multiplier (0.8-1.2)
+           stage_multiplier = {
+               GrowthStage.DORMANT: 0.9,
+               GrowthStage.BLOOM: 1.1,
+               GrowthStage.FRUIT_DEVELOPMENT: 1.0,
+               GrowthStage.HARVEST: 0.8
+           }.get(self.growth_stage, 1.0)
+         
+           # 3. Resource efficiency (0-0.3 penalty)
+           water, fertilizer, pesticide = action
+           resource_penalty = (
+               0.15 * max(0, water - 0.7) +      # Penalize water >0.7
+               0.10 * max(0, fertilizer - 0.6) +  # Penalize fertilizer >0.6
+               0.05 * max(0, pesticide - 0.5)     # Penalize pesticide >0.5
+           )
+        
+           # 4. Weather adaptation (0-0.1 bonus)
+           weather = self._load_weather(self.step_count % 365)
+           weather_bonus = 0
+           if weather[1] > 0.7:  # High rain
+               weather_bonus += 0.05 * (1 - min(1, water/0.4))
+           if weather[0] > 0.8:  # High temp
+               weather_bonus += 0.05 * min(1, water/0.6)
+        
+           # 5. Combine with strict bounds
+           total_reward = (
+               (soil_score * stage_multiplier) -  # Base (0-0.6)
+               resource_penalty +                # (0-0.3)
+               weather_bonus                     # (0-0.1)
+           )
+        
+           # 6. Final clip and scale to [0,1]
+           final_reward = min(1.0, max(0, total_reward))
+        
+           return float(final_reward)
+         
+       except Exception as e:
+           print(f"Error calculating reward: {e}")
+           return 0.0  # Safe default
+
+
+-------------------------------------------------
+#drl_models.py
+
+
+import os 
+import torch
+import torch.nn as nn
+import numpy as np
+import yaml
+from gymnasium import Env
+from gymnasium.spaces import Box
+from stable_baselines3 import PPO, DQN, A2C
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from stable_baselines3.common.policies import ActorCriticPolicy
+from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.monitor import Monitor
+from typing import Dict, List, Tuple, Type, Union
+
+class SoilFeaturesExtractor(BaseFeaturesExtractor):
+    """
+    Custom neural network for feature extraction from soil observations.
+    Processes soil layers and previous actions to create meaningful features.
+    """
+    def __init__(self, observation_space: Dict, features_dim: int = 128):
+        super().__init__(observation_space, features_dim)
+        
+        # Extract individual spaces
+        soil_space = observation_space.spaces['soil']
+        weather_space = observation_space.spaces['weather']
+        growth_space = observation_space.spaces['growth_stage']
+        actions_space = observation_space.spaces['previous_actions']
+        
+        total_dim = (soil_space.shape[0] + weather_space.shape[0] + 
+                    growth_space.shape[0] + actions_space.shape[0])
+
+        # Define the feature extraction network
+        self.net = nn.Sequential(
+            nn.Linear(total_dim, 256),
+            nn.ReLU(),
+            nn.LayerNorm(256),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.LayerNorm(128),
+            nn.Linear(128, features_dim),
+            nn.ReLU()
+        )
+    
+    def forward(self, observations: Dict[str, torch.Tensor]) -> torch.Tensor:
+        # Concatenate all observations
+        obs_tensor = torch.cat([
+            observations['soil'],
+            observations['weather'],
+            observations['growth_stage'].float(),
+            observations['previous_actions']
+        ], dim=-1)
+        return self.net(obs_tensor)
+
+class CustomActorCriticPolicy(ActorCriticPolicy):
+    """
+    Custom policy network architecture for actor-critic methods (PPO, A2C).
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs, net_arch=[dict(pi=[256, 128], vf=[256, 128])])
+        self.ortho_init = True  # Use orthogonal initialization
+
+class DRLModelFactory:
+    """
+    Factory class for creating different DRL models with consistent configurations.
+    """
+    def __init__(self, config_path: str = 'configs/params.yaml'):
+        self.config = self._load_config(config_path)
+        self.rl_config = self.config['rl']
+    
+    @staticmethod
+    def _load_config(config_path: str) -> Dict:
+        """Load YAML configuration file."""
+        with open(config_path) as f:
+            return yaml.safe_load(f)
+    
+    def create_model(self, 
+                env: Union[Env, DummyVecEnv], 
+                model_type: str = 'ppo',
+                policy_kwargs: Dict = None) -> Union[PPO, DQN, A2C]:
+       
+       
+       common_kwargs = {
+           'verbose': 1,
+           'tensorboard_log': "./logs/",
+           'gamma': self.rl_config.get('gamma', 0.99),
+           'device': 'auto'
+       }
+
+       if policy_kwargs is None:
+        policy_kwargs = {
+            'features_extractor_class': SoilFeaturesExtractor,
+            'features_extractor_kwargs': {'features_dim': 128},
+            'net_arch': dict(pi=[256, 128], vf=[256, 128]),
+            'activation_fn': nn.Tanh,
+            'ortho_init': True
+        }
+    
+       # Get algorithm-specific config (default to empty dict if missing)
+       algo_config = self.rl_config.get(f"{model_type.lower()}_params", {})
+     
+       if model_type.lower() == 'ppo':
+           return PPO(
+               policy="MultiInputPolicy",
+               env=env,
+               learning_rate=algo_config.get('learning_rate', 0.0003),
+               n_steps=algo_config.get('n_steps', 2048),
+               batch_size=algo_config.get('batch_size', 128),
+               n_epochs=algo_config.get('n_epochs', 10),
+               policy_kwargs=policy_kwargs,
+               **common_kwargs
+           )
+       elif model_type.lower() == 'dqn':
+           return DQN(
+               policy="MultiInputPolicy",
+               env=env,
+               learning_rate=algo_config.get('learning_rate', 0.0001),
+               buffer_size=algo_config.get('buffer_size', 100000),
+               learning_starts=algo_config.get('learning_starts', 10000),
+               batch_size=algo_config.get('batch_size', 32),
+               train_freq=algo_config.get('train_freq', 4),
+               gradient_steps=algo_config.get('gradient_steps', 1),
+               target_update_interval=algo_config.get('target_update_interval', 10000),
+               exploration_fraction=algo_config.get('exploration_fraction', 0.1),
+               exploration_initial_eps=algo_config.get('exploration_initial_eps', 1.0),
+               exploration_final_eps=algo_config.get('exploration_final_eps', 0.01),
+               policy_kwargs=policy_kwargs,
+               **common_kwargs
+           )
+       elif model_type.lower() == 'a2c':
+           return A2C(
+               policy="MultiInputPolicy",
+               env=env,
+               learning_rate=algo_config.get('learning_rate', 0.0007),
+               n_steps=algo_config.get('n_steps', 5),
+               policy_kwargs=policy_kwargs,
+               **common_kwargs
+           )
+       else:
+           raise ValueError(f"Unsupported model type: {model_type}")
+    
+class ModelTrainer:
+    """
+    Handles training and evaluation of DRL models.
+    """
+    def __init__(self, config_path: str = 'configs/params.yaml'):
+        self.config = self._load_config(config_path)
+        self.model_factory = DRLModelFactory(config_path)
+    
+    @staticmethod
+    def _load_config(config_path: str) -> Dict:
+        """Load YAML configuration file."""
+        with open(config_path) as f:
+            return yaml.safe_load(f)
+    
+    def train_model(self, 
+                   env: Union[Env, DummyVecEnv],
+                   model_type: str = 'ppo',
+                   total_timesteps: int = None,
+                   save_path: str = None) -> Union[PPO, DQN, A2C]:
+        """
+        Train a DRL model with specified parameters.
+        
+        Args:
+            env: Training environment
+            model_type: Type of model to train
+            total_timesteps: Number of training timesteps
+            save_path: Path to save trained model
+            
+        Returns:
+            Trained model
+        """
+        if total_timesteps is None:
+            total_timesteps = self.config['rl']['total_timesteps']
+        
+        model = self.model_factory.create_model(env, model_type)
+        
+        try:
+            model.learn(
+                total_timesteps=total_timesteps,
+                progress_bar=True,
+                tb_log_name=f"{model_type}_run"
+            )
+            
+            if save_path:
+                self.save_model(model, save_path)
+                
+            return model
+        except Exception as e:
+            print(f"Training failed: {e}")
+            if 'model' in locals():
+                model.save("models/partial_model")
+            raise
+    
+    @staticmethod
+    def save_model(model: Union[PPO, DQN, A2C], path: str) -> None:
+        """Save trained model to disk."""
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        model.save(path)
+        print(f"Model saved to {path}")
+    
+    @staticmethod
+    def load_model(path: str, env: Union[Env, DummyVecEnv]) -> Union[PPO, DQN, A2C]:
+        """Load trained model from disk."""
+        if 'ppo' in path.lower():
+            return PPO.load(path, env=env)
+        elif 'dqn' in path.lower():
+            return DQN.load(path, env=env)
+        elif 'a2c' in path.lower():
+            return A2C.load(path, env=env)
+        else:
+            raise ValueError("Could not determine model type from path")
+
+class ModelEvaluator:
+    """
+    Handles evaluation of trained DRL models.
+    """
+    @staticmethod
+    def evaluate_model(model: Union[PPO, DQN, A2C], 
+                      env: Env, 
+                      n_episodes: int = 10) -> Dict[str, float]:
+        """
+        Evaluate model performance over multiple episodes. 
+        Args:
+            model: Trained model to evaluate
+            env: Evaluation environment
+            n_episodes: Number of evaluation episodes
+        Returns:
+            Dictionary with evaluation metrics
+        """
+        rewards = []
+        episode_lengths = []
+        
+        eval_env = env.envs[0] if isinstance(env, DummyVecEnv) else env
+        
+        for _ in range(n_episodes):
+            obs, _ = eval_env.reset()
+            done = False
+            episode_reward = 0
+            episode_length = 0
+            
+            while not done:
+                action, _ = model.predict(obs, deterministic=True)
+                obs, reward, terminated, truncated, _ = eval_env.step(action)
+                done = terminated or truncated
+                episode_reward += reward
+                episode_length += 1
+            
+            rewards.append(episode_reward)
+            episode_lengths.append(episode_length)
+        
+        return {
+            'mean_reward': np.mean(rewards),
+            'std_reward': np.std(rewards),
+            'max_reward': np.max(rewards),
+            'min_reward': np.min(rewards),
+            'mean_episode_length': np.mean(episode_lengths),
+            'evaluation_episodes': n_episodes
+        }
+
+
+-----------------------------------------------
+#main.py
+
+import os
+import yaml
+from models.drl_models import DRLModelFactory, ModelTrainer, ModelEvaluator
+from environment.apple_farming_env import AppleFarmingEnv
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.vec_env import DummyVecEnv
+from utils.data_processing import load_and_preprocess_data
+from utils.weather_generator import generate_weather_data
+from utils.visualization import generate_visualizations, plot_training_progress
+
+def train_ppo(config_path: str = 'configs/params.yaml'):
+    """Train using PPO algorithm"""
+    try:
+        print("\n=== Training PPO Model ===")
+        # Create environment
+        env = AppleFarmingEnv(config_path)
+        env = Monitor(env)
+        env = DummyVecEnv([lambda: env])
+        
+        # Train the model
+        trainer = ModelTrainer(config_path)
+        model = trainer.train_model(
+            env=env,
+            model_type='ppo',
+            save_path=f"models/ppo_apple_farming"
+        )
+        
+        # Evaluate
+        evaluator = ModelEvaluator()
+        metrics = evaluator.evaluate_model(model, env)
+        print("\nPPO Evaluation Metrics:")
+        for k, v in metrics.items():
+            print(f"{k}: {v:.2f}")
+
+        print("\nGenerating PPO visualizations...")
+        generate_visualizations(env, model)
+        
+        return model, env
+            
+    except Exception as e:
+        print(f"PPO Training failed: {e}")
+        raise
+
+def train_dqn(config_path: str = 'configs/params.yaml'):
+    """Train using DQN algorithm"""
+    try:
+        print("\n=== Training DQN Model ===")
+        # Create environment
+        env = AppleFarmingEnv(config_path)
+        env = Monitor(env)
+        env = DummyVecEnv([lambda: env])
+        
+        # Train the model
+        trainer = ModelTrainer(config_path)
+        model = trainer.train_model(
+            env=env,
+            model_type='dqn',
+            save_path=f"models/dqn_apple_farming"
+        )
+        
+        # Evaluate
+        evaluator = ModelEvaluator()
+        metrics = evaluator.evaluate_model(model, env)
+        print("\nDQN Evaluation Metrics:")
+        for k, v in metrics.items():
+            print(f"{k}: {v:.2f}")
+
+        print("\nGenerating DQN visualizations...")
+        generate_visualizations(env, model)
+
+        return model, env
+            
+    except Exception as e:
+        print(f"DQN Training failed: {e}")
+        raise
+
+def train_a2c(config_path: str = 'configs/params.yaml'):
+    """Train using A2C algorithm"""
+    try:
+        print("\n=== Training A2C Model ===")
+        # Create environment
+        env = AppleFarmingEnv(config_path)
+        env = Monitor(env)
+        vec_env  = DummyVecEnv([lambda: env])
+        
+        # Train the model
+        trainer = ModelTrainer(config_path)
+        model = trainer.train_model(
+            env=vec_env,
+            model_type='a2c',
+            save_path=f"models/a2c_apple_farming"
+        )
+        
+        # Evaluate
+        evaluator = ModelEvaluator()
+        metrics = evaluator.evaluate_model(model, env)
+        print("\nA2C Evaluation Metrics:")
+        for k, v in metrics.items():
+            print(f"{k}: {v:.2f}")
+
+        print("\nGenerating A2C visualizations...")
+        generate_visualizations(env, model)
+        
+        return model, env
+            
+    except Exception as e:
+        print(f"A2C Training failed: {e}")
+        raise
+
+def main():
+    # Preprocess data if needed
+    if not os.path.exists("data/processed/normalized"):
+        load_and_preprocess_data()
+    if not os.path.exists("data/processed/weather_data.npy"):
+        generate_weather_data()
+    
+    # Load config
+    with open("configs/params.yaml") as f:
+        config = yaml.safe_load(f)
+    
+
+    #train_ppo()
+    #train_dqn()  # Uncomment to train DQN
+    train_a2c()  # Uncomment to train A2C
+
+    plot_training_progress()
+
+if __name__ == "__main__":
+    main()
+
+
+-------------------------------------------------
+#params.yaml
+
+environment:
+  apple_variety: "Fuji"
+  soil_layers: ["nitrogen", "clay", "silt", "sand", "ph_water"]
+  growth_stage_days: [30, 60, 90]
+  normalization_ranges:
+    nitrogen: [0, 100]
+    clay: [0, 100]
+    silt: [0, 100]
+    sand: [0, 100]
+    ph_water: [0, 14]
+  optimal_conditions:
+    nitrogen: [40, 70]
+    ph_water: [5.5, 6.5]
+    clay: [20, 35]
+    silt: [25, 50]
+    sand: [25, 50]
+
+rl:
+  # Common parameters
+  learning_rate: 0.00025
+  gamma: 0.99
+  total_timesteps: 500000
+  log_interval: 10
+  
+  # PPO specific
+  ppo_params:
+    batch_size: 128
+    n_steps: 2048
+    n_epochs: 10
+    clip_range: 0.15
+    
+  # DQN specific
+  dqn_params:
+    batch_size: 128
+    buffer_size: 100000
+    learning_starts: 10000
+    train_freq: 4
+    gradient_steps: 1
+    target_update_interval: 10000
+    exploration_fraction: 0.1
+    exploration_initial_eps: 1.0
+    exploration_final_eps: 0.01
+    max_grad_norm: 10
+    
+  # A2C specific
+  a2c_params:
+    n_steps: 5
+    batch_size: 64
+
